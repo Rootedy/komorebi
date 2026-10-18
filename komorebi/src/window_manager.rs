@@ -161,7 +161,9 @@ impl WindowManager {
             unmanaged_window_operation_behaviour: OperationBehaviour::Op,
             resize_delta: 50,
             focus_follows_mouse: None,
-            mouse_follows_focus: true,
+            // custom: the user wants the cursor to never jump to the center of
+            // focused windows, so this can never be automatically re-enabled
+            mouse_follows_focus: false,
             hotwatch: Hotwatch::new()?,
             has_pending_raise_op: false,
             pending_move_op: Arc::new(None),
@@ -882,19 +884,92 @@ impl WindowManager {
             .and_then(|c| origin_workspace.containers().iter().position(|cc| cc == c));
 
         if let Some(origin_container_idx) = origin_container_idx {
-            // Moving normal container window
-            self.transfer_container(
-                (
-                    origin_monitor_idx,
-                    origin_workspace_idx,
-                    origin_container_idx,
-                ),
-                (
-                    target_monitor_idx,
-                    target_workspace_idx,
-                    target_container_idx,
-                ),
-            )?;
+            // custom: if the window being transferred lives in a stack container with more
+            // than one window, pop it out into its own container first so that only the
+            // focused window travels, instead of the entire stack
+            let is_multi_window_container = origin_workspace
+                .containers()
+                .get(origin_container_idx)
+                .map(|c| c.windows().len() > 1)
+                .unwrap_or_default();
+
+            // Only split on the focused container, as `new_container_for_focused_window`
+            // operates on the workspace's focused container
+            let origin_container_is_focused =
+                origin_workspace.focused_container_idx() == origin_container_idx;
+
+            if is_multi_window_container && origin_container_is_focused {
+                origin_workspace.new_container_for_focused_window()?;
+
+                let split_container_idx = origin_workspace
+                    .container_for_window(w_hwnd)
+                    .and_then(|c| origin_workspace.containers().iter().position(|cc| cc == c));
+
+                if let Some(split_idx) = split_container_idx {
+                    // Only proceed with the single-window transfer if the split actually
+                    // happened; otherwise fall back to moving the whole container
+                    let split_is_single = origin_workspace
+                        .containers()
+                        .get(split_idx)
+                        .map(|c| c.windows().len() == 1)
+                        .unwrap_or_default();
+
+                    if split_is_single {
+                        self.transfer_container(
+                            (
+                                origin_monitor_idx,
+                                origin_workspace_idx,
+                                split_idx,
+                            ),
+                            (
+                                target_monitor_idx,
+                                target_workspace_idx,
+                                target_container_idx,
+                            ),
+                        )?;
+                    } else {
+                        self.transfer_container(
+                            (
+                                origin_monitor_idx,
+                                origin_workspace_idx,
+                                origin_container_idx,
+                            ),
+                            (
+                                target_monitor_idx,
+                                target_workspace_idx,
+                                target_container_idx,
+                            ),
+                        )?;
+                    }
+                } else {
+                    self.transfer_container(
+                        (
+                            origin_monitor_idx,
+                            origin_workspace_idx,
+                            origin_container_idx,
+                        ),
+                        (
+                            target_monitor_idx,
+                            target_workspace_idx,
+                            target_container_idx,
+                        ),
+                    )?;
+                }
+            } else {
+                // Moving normal container window
+                self.transfer_container(
+                    (
+                        origin_monitor_idx,
+                        origin_workspace_idx,
+                        origin_container_idx,
+                    ),
+                    (
+                        target_monitor_idx,
+                        target_workspace_idx,
+                        target_container_idx,
+                    ),
+                )?;
+            }
         } else if let Some(idx) = origin_workspace
             .floating_windows()
             .iter()
@@ -1023,6 +1098,67 @@ impl WindowManager {
         Ok(())
     }
 
+    /// custom: sends the focused window alone to the next monitor. If the focused
+    /// window lives in a stack container, it is first split into its own container
+    /// (reusing the logic inside `transfer_window`) so that only the focused window
+    /// travels.
+    #[tracing::instrument(skip(self))]
+    pub fn send_focused_window_to_next_monitor(&mut self) -> eyre::Result<()> {
+        let origin_monitor_idx = self.focused_monitor_idx();
+        let origin_workspace_idx = self.focused_workspace_idx()?;
+
+        let monitor_count = self.monitors().len();
+        if monitor_count < 2 {
+            bail!("there is no next monitor to send the window to");
+        }
+
+        let hwnd = self.focused_window()?.hwnd;
+
+        let target_monitor_idx = (origin_monitor_idx + 1) % monitor_count;
+
+        let target_workspace_idx = self
+            .monitors()
+            .get(target_monitor_idx)
+            .ok_or_eyre("there is no monitor at this idx")?
+            .focused_workspace_idx();
+
+        let target_container_idx = self
+            .monitors()
+            .get(target_monitor_idx)
+            .ok_or_eyre("there is no monitor at this idx")?
+            .focused_workspace()
+            .ok_or_eyre("there is no focused workspace for this monitor")?
+            .container_idx_from_current_point()
+            // Default to 0 in the case of an empty workspace
+            .unwrap_or(0);
+
+        self.transfer_window(
+            (origin_monitor_idx, origin_workspace_idx, hwnd),
+            (target_monitor_idx, target_workspace_idx, target_container_idx),
+        )?;
+
+        // Update both monitors so no ghost tiles remain, mirroring the mouse drag
+        // cross monitor move path
+        self.focus_monitor(origin_monitor_idx)?;
+        let origin_monitor = self
+            .monitors_mut()
+            .get_mut(origin_monitor_idx)
+            .ok_or_eyre("there is no monitor at this idx")?;
+        origin_monitor.focus_workspace(origin_workspace_idx)?;
+        self.update_focused_workspace(false, false)?;
+
+        self.focus_monitor(target_monitor_idx)?;
+        let target_monitor = self
+            .monitors_mut()
+            .get_mut(target_monitor_idx)
+            .ok_or_eyre("there is no monitor at this idx")?;
+        target_monitor.focus_workspace(target_workspace_idx)?;
+        self.update_focused_workspace(false, false)?;
+
+        // Make sure to give focus to the moved window again
+        self.focused_window()?.focus(self.mouse_follows_focus)
+    }
+
     #[tracing::instrument(skip(self))]
     pub fn swap_containers(
         &mut self,
@@ -1130,8 +1266,8 @@ impl WindowManager {
             } else {
                 let desktop_window = Window::from(WindowsApi::desktop_window()?);
 
-                let rect = self.focused_monitor_size()?;
-                WindowsApi::center_cursor_in_rect(&rect)?;
+                // custom: no longer recenter the cursor when focusing the desktop;
+                // the cursor must never move on its own
 
                 match WindowsApi::raise_and_focus_window(desktop_window.hwnd) {
                     Ok(()) => {}

@@ -353,6 +353,9 @@ impl WindowManager {
             }
             SocketMessage::StackWindow(direction) => self.add_window_to_container(direction)?,
             SocketMessage::UnstackWindow => self.remove_window_from_container()?,
+            SocketMessage::SendFocusedWindowToNextMonitor => {
+                self.send_focused_window_to_next_monitor()?
+            }
             SocketMessage::StackAll => self.stack_all()?,
             SocketMessage::UnstackAll => self.unstack_all(true)?,
             SocketMessage::CycleStack(direction) => {

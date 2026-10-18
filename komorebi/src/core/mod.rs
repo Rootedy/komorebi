@@ -75,6 +75,9 @@ pub enum SocketMessage {
     FocusStackWindow(usize),
     StackAll,
     UnstackAll,
+    // custom: sends the focused window alone (out of its stack container) to the
+    // next monitor
+    SendFocusedWindowToNextMonitor,
     ResizeWindowEdge(OperationDirection, Sizing),
     ResizeWindowAxis(Axis, Sizing),
     MoveContainerToLastWorkspace,

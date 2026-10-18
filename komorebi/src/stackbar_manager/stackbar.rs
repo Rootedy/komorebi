@@ -1,4 +1,5 @@
 use crate::DEFAULT_CONTAINER_PADDING;
+use crate::DATA_DIR;
 use crate::WINDOWS_11;
 use crate::WindowsApi;
 use crate::border_manager::BORDER_OFFSET;
@@ -17,22 +18,26 @@ use crate::stackbar_manager::STACKBAR_TAB_HEIGHT;
 use crate::stackbar_manager::STACKBAR_TAB_WIDTH;
 use crate::stackbar_manager::STACKBAR_UNFOCUSED_TEXT_COLOUR;
 use crate::stackbar_manager::STACKBARS_CONTAINERS;
+use crate::core::SocketMessage;
 use crate::windows_api;
 use crossbeam_utils::atomic::AtomicConsume;
+use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Duration;
+use uds_windows::UnixStream;
 use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Foundation::HINSTANCE;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Foundation::LPARAM;
 use windows::Win32::Foundation::LRESULT;
+use windows::Win32::Foundation::POINT;
 use windows::Win32::Foundation::WPARAM;
 use windows::Win32::Graphics::Gdi::CreateFontIndirectW;
 use windows::Win32::Graphics::Gdi::CreatePen;
 use windows::Win32::Graphics::Gdi::CreateSolidBrush;
-use windows::Win32::Graphics::Gdi::DT_CENTER;
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::Graphics::Gdi::DT_END_ELLIPSIS;
 use windows::Win32::Graphics::Gdi::DT_SINGLELINE;
 use windows::Win32::Graphics::Gdi::DT_VCENTER;
@@ -69,6 +74,25 @@ use windows::Win32::UI::WindowsAndMessaging::SetLayeredWindowAttributes;
 use windows::Win32::UI::WindowsAndMessaging::TranslateMessage;
 use windows::Win32::UI::WindowsAndMessaging::WM_DESTROY;
 use windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDOWN;
+use windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP;
+use windows::Win32::UI::WindowsAndMessaging::AppendMenuW;
+use windows::Win32::UI::WindowsAndMessaging::CreatePopupMenu;
+use windows::Win32::UI::WindowsAndMessaging::DestroyMenu;
+use windows::Win32::UI::WindowsAndMessaging::DI_NORMAL;
+use windows::Win32::UI::WindowsAndMessaging::DrawIconEx;
+use windows::Win32::UI::WindowsAndMessaging::GCLP_HICON;
+use windows::Win32::UI::WindowsAndMessaging::GetClassLongPtrW;
+use windows::Win32::UI::WindowsAndMessaging::HICON;
+use windows::Win32::UI::WindowsAndMessaging::ICON_BIG;
+use windows::Win32::UI::WindowsAndMessaging::ICON_SMALL;
+use windows::Win32::UI::WindowsAndMessaging::MF_STRING;
+use windows::Win32::UI::WindowsAndMessaging::SMTO_ABORTIFHUNG;
+use windows::Win32::UI::WindowsAndMessaging::SendMessageTimeoutW;
+use windows::Win32::UI::WindowsAndMessaging::TPM_NONOTIFY;
+use windows::Win32::UI::WindowsAndMessaging::TPM_RETURNCMD;
+use windows::Win32::UI::WindowsAndMessaging::TPM_RIGHTBUTTON;
+use windows::Win32::UI::WindowsAndMessaging::TrackPopupMenuEx;
+use windows::Win32::UI::WindowsAndMessaging::WM_GETICON;
 use windows::Win32::UI::WindowsAndMessaging::WM_SETCURSOR;
 use windows::Win32::UI::WindowsAndMessaging::WNDCLASSW;
 use windows::Win32::UI::WindowsAndMessaging::WS_EX_LAYERED;
@@ -80,6 +104,103 @@ use windows::core::PCWSTR;
 #[derive(Debug)]
 pub struct Stackbar {
     pub hwnd: isize,
+}
+
+/// custom: returns the stackbar tab index under the given client x coordinate
+fn tab_index_at(container: &Container, x: i32) -> Option<usize> {
+    let width = STACKBAR_TAB_WIDTH.load_consume();
+    let gap = DEFAULT_CONTAINER_PADDING.load_consume();
+
+    for (index, _) in container.windows().iter().enumerate() {
+        let left = gap + (index as i32 * (width + gap));
+        let right = left + width;
+
+        if x >= left && x <= right {
+            return Some(index);
+        }
+    }
+
+    None
+}
+
+/// custom: focuses (restores, positions and focuses) the window corresponding to the
+/// stackbar tab at the given index, hiding the other windows in the stack
+unsafe fn focus_tab(container: &Container, index: usize) {
+    let focused_window_idx = container.focused_window_idx();
+    let focused_window_rect = WindowsApi::window_rect(
+        container.focused_window().cloned().unwrap_or_default().hwnd,
+    )
+    .unwrap_or_default();
+
+    for (i, window) in container.windows().iter().enumerate() {
+        if i == index {
+            // If we are focusing a window that isn't currently focused in the
+            // stackbar, make sure we update its location so that it doesn't
+            // render on top of other tiles before eventually ending up in the
+            // correct tile
+            if i != focused_window_idx
+                && let Err(err) = window.set_position(&focused_window_rect, false)
+            {
+                tracing::error!(
+                    "stackbar focus_tab repositioning error: hwnd {} ({})",
+                    *window,
+                    err
+                );
+            }
+
+            window.restore_with_border(false);
+            if let Err(err) = window.focus(false) {
+                tracing::error!("stackbar focus_tab focus error: hwnd {} ({})", *window, err);
+            }
+        } else {
+            // Hide any windows in the stack that don't correspond to the window
+            // we have focused
+            window.hide_with_border(false);
+        }
+    }
+}
+
+/// custom: retrieves the application icon for the given window, trying WM_GETICON
+/// (small, then large) first and falling back to the window class icon
+unsafe fn window_icon(hwnd: isize) -> Option<HICON> {
+    let hwnd_h = HWND(windows_api::as_ptr!(hwnd));
+
+    for flag in [ICON_SMALL, ICON_BIG] {
+        let mut result: usize = 0;
+        unsafe {
+            SendMessageTimeoutW(
+                hwnd_h,
+                WM_GETICON,
+                WPARAM(flag as usize),
+                LPARAM(0),
+                SMTO_ABORTIFHUNG,
+                100,
+                Some(&mut result),
+            );
+        }
+
+        if result != 0 {
+            return Some(HICON(result as *mut _));
+        }
+    }
+
+    let class_icon = unsafe { GetClassLongPtrW(hwnd_h, GCLP_HICON) };
+    if class_icon != 0 {
+        return Some(HICON(class_icon as *mut _));
+    }
+
+    None
+}
+
+/// custom: sends a `SocketMessage` to the komorebi command socket
+fn send_socket_message(message: SocketMessage) {
+    std::thread::spawn(move || {
+        if let Ok(json) = serde_json::to_string(&message)
+            && let Ok(mut stream) = UnixStream::connect(DATA_DIR.join("komorebi.sock"))
+        {
+            let _ = stream.write_all(json.as_bytes());
+        }
+    });
 }
 
 impl From<isize> for Stackbar {
@@ -276,16 +397,33 @@ impl Stackbar {
                     StackbarLabel::Title => window.title()?,
                 };
 
+                // custom: draw the application icon at the left edge of the tab
+                let icon_size = 16;
+                if let Some(icon) = window_icon(window.hwnd) {
+                    let _ = DrawIconEx(
+                        hdc,
+                        rect.left + 4,
+                        (height - icon_size) / 2,
+                        icon,
+                        icon_size,
+                        icon_size,
+                        0,
+                        None,
+                        DI_NORMAL,
+                    );
+                }
+
                 let mut tab_title: Vec<u16> = label.encode_utf16().collect();
 
-                rect.left_padding(10);
-                rect.right_padding(10);
+                // custom: make room for the icon and left-align the text
+                rect.left += icon_size + 8;
+                rect.right -= 10;
 
                 DrawTextW(
                     hdc,
                     &mut tab_title,
                     &mut rect.into(),
-                    DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS,
+                    DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
                 );
             }
 
@@ -330,53 +468,99 @@ impl Stackbar {
                     let stackbars_containers = STACKBARS_CONTAINERS.lock();
                     if let Some(container) = stackbars_containers.get(&(hwnd.0 as isize)) {
                         let x = l_param.0 as i32 & 0xFFFF;
+
+                        if let Some(index) = tab_index_at(container, x) {
+                            focus_tab(container, index);
+                        }
+                    }
+
+                    LRESULT(0)
+                }
+                WM_RBUTTONUP => {
+                    let stackbars_containers = STACKBARS_CONTAINERS.lock();
+                    if let Some(container) = stackbars_containers.get(&(hwnd.0 as isize)) {
+                        let x = l_param.0 as i32 & 0xFFFF;
                         let y = (l_param.0 as i32 >> 16) & 0xFFFF;
 
-                        let width = STACKBAR_TAB_WIDTH.load_consume();
-                        let height = STACKBAR_TAB_HEIGHT.load_consume();
-                        let gap = DEFAULT_CONTAINER_PADDING.load_consume();
+                        if let Some(index) = tab_index_at(container, x) {
+                            // Focus the tab that was right-clicked, then offer actions for it
+                            focus_tab(container, index);
+                            let window_hwnd = container
+                                .windows()
+                                .get(index)
+                                .map(|w| w.hwnd)
+                                .unwrap_or_default();
 
-                        let focused_window_idx = container.focused_window_idx();
-                        let focused_window_rect = WindowsApi::window_rect(
-                            container.focused_window().cloned().unwrap_or_default().hwnd,
-                        )
-                        .unwrap_or_default();
+                            let mut point = POINT { x, y };
+                            let _ = ClientToScreen(hwnd, &mut point);
 
-                        for (index, window) in container.windows().iter().enumerate() {
-                            let left = gap + (index as i32 * (width + gap));
-                            let right = left + width;
-                            let top = 0;
-                            let bottom = height;
-
-                            if x >= left && x <= right && y >= top && y <= bottom {
-                                // If we are focusing a window that isn't currently focused in the
-                                // stackbar, make sure we update its location so that it doesn't render
-                                // on top of other tiles before eventually ending up in the correct
-                                // tile
-                                if index != focused_window_idx
-                                    && let Err(err) =
-                                        window.set_position(&focused_window_rect, false)
-                                {
-                                    tracing::error!(
-                                        "stackbar WM_LBUTTONDOWN repositioning error: hwnd {} ({})",
-                                        *window,
-                                        err
+                            match CreatePopupMenu() {
+                                Ok(menu) => {
+                                    let _ = AppendMenuW(
+                                        menu,
+                                        MF_STRING,
+                                        1,
+                                        PCWSTR(wide_string("Fechar").as_ptr()),
                                     );
-                                }
-
-                                // Restore the window corresponding to the tab we have clicked
-                                window.restore_with_border(false);
-                                if let Err(err) = window.focus(false) {
-                                    tracing::error!(
-                                        "stackbar WMLBUTTONDOWN focus error: hwnd {} ({})",
-                                        *window,
-                                        err
+                                    let _ = AppendMenuW(
+                                        menu,
+                                        MF_STRING,
+                                        2,
+                                        PCWSTR(wide_string("Remover da stack").as_ptr()),
                                     );
+                                    let _ = AppendMenuW(
+                                        menu,
+                                        MF_STRING,
+                                        3,
+                                        PCWSTR(wide_string("Mover para o outro monitor").as_ptr()),
+                                    );
+
+                                    // With TPM_RETURNCMD the menu id is returned directly in the BOOL
+                                    let choice = TrackPopupMenuEx(
+                                        menu,
+                                        (TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY).0,
+                                        point.x,
+                                        point.y,
+                                        hwnd,
+                                        None,
+                                    )
+                                    .0;
+
+                                    let _ = DestroyMenu(menu);
+
+                                    match choice {
+                                        1 => {
+                                            if let Err(err) = WindowsApi::close_window(window_hwnd) {
+                                                tracing::error!(
+                                                    "stackbar context menu close error: {err}"
+                                                );
+                                            }
+                                        }
+                                        2 => {
+                                            // Wait for the focus change events triggered by
+                                            // focus_tab to process before unstacking the window
+                                            std::thread::spawn(move || {
+                                                std::thread::sleep(Duration::from_millis(300));
+                                                send_socket_message(SocketMessage::UnstackWindow);
+                                            });
+                                        }
+                                        3 => {
+                                            // The click on the menu focuses the tab; wait for the
+                                            // focus events to process, then send the focused window
+                                            // alone to the next monitor
+                                            std::thread::spawn(move || {
+                                                std::thread::sleep(Duration::from_millis(300));
+                                                send_socket_message(
+                                                    SocketMessage::SendFocusedWindowToNextMonitor,
+                                                );
+                                            });
+                                        }
+                                        _ => {}
+                                    }
                                 }
-                            } else {
-                                // Hide any windows in the stack that don't correspond to the window
-                                // we have clicked
-                                window.hide_with_border(false);
+                                Err(error) => {
+                                    tracing::error!("stackbar context menu error: {error}");
+                                }
                             }
                         }
                     }

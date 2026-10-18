@@ -832,14 +832,31 @@ impl WindowManager {
                     }
                 }
             }
-            WindowManagerEvent::MouseCapture(..)
-            | WindowManagerEvent::Cloak(..)
-            | WindowManagerEvent::TitleUpdate(..) => {}
+            WindowManagerEvent::MouseCapture(..) | WindowManagerEvent::TitleUpdate(..) => {}
+            // custom: remember the pre-minimize geometry of the window being cloaked
+            // so that it can be reapplied when the window is restored
+            WindowManagerEvent::Cloak(_, window) => {
+                if let Err(error) = self.save_window_geometry_on_cloak(&window) {
+                    tracing::debug!("could not remember geometry on cloak: {error}");
+                }
+            }
         };
 
         // If we unmanaged a window, it shouldn't be immediately hidden behind managed windows
         if let WindowManagerEvent::Unmanage(mut window) = event {
+            // custom: forget any remembered geometry; a closed window has nothing
+            // to be restored to anymore
+            self.last_window_geometry.remove(&window.hwnd);
+
             window.center(&self.focused_monitor_work_area()?, true)?;
+        }
+
+        // custom: if a window was restored (uncloaked) reapply its remembered geometry
+        // after the regular uncloak handling and any resulting layout updates
+        if matches!(event, WindowManagerEvent::Uncloak(_, _))
+            && let Err(error) = self.apply_saved_window_geometry(event.window().hwnd)
+        {
+            tracing::debug!("could not reapply remembered geometry on uncloak: {error}");
         }
 
         // Update list of known_hwnds and their monitor/workspace index pair

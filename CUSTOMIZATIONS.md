@@ -143,6 +143,45 @@ disable` não sobreviviam a reinícios: o flag não é persistido no `state.json
 e o carregador de config restaurava `true` a cada start. Com os três pontos,
 não existe mais caminho de código que desloque o cursor no processo de foco.
 
+## 7. Memória de geometria por janela (minimizar/restaurar)
+
+**Arquivos:** `komorebi/src/state.rs` (`PersistedWindowGeometry`, campo
+`last_window_geometry`), `komorebi/src/window_manager.rs`
+(`save_window_geometry_on_cloak`, `apply_saved_window_geometry`),
+`komorebi/src/process_event.rs` (hooks em `Cloak`/`Uncloak`/`Unmanage`),
+`komorebi/src/static_config.rs` (inicialização do campo).
+
+**O que foi alterado:** janelas tiled que são minimizadas lembram o retângulo
+(posição + tamanho) que tinham no momento do minimize, e ao serem restauradas
+têm esse retângulo reaplicado — em qualquer monitor.
+
+1. **Captura (`Cloak`):** ao minimizar (que o Windows reporta como
+   `ObjectCloaked`), o retângulo é lido do `latest_layout` do workspace (o rect
+   do SO já está em -32000 nesse momento) e gravado em
+   `last_window_geometry[hwnd]`, junto com `exe` e `title` da janela. Janelas
+   flutuantes, maximizadas ou em monocle são ignoradas.
+2. **Reaplicação (`Uncloak`):** ao restaurar, depois do tratamento normal do
+   uncloak (reconciliação/re-tile), o retângulo salvo é reaplicado com
+   `Window::set_position`. Um hwnd reutilizado por acaso é detectado pela
+   comparação do nome do processo (`exe`); se não bater, a entrada é descartada.
+3. **Prune (`Unmanage`):** janela fechada esquece a geometria memorizada.
+4. **Persistência:** o mapa vai dentro do `State` (serializado no
+   `%TEMP%\komorebi.state.json` com `komorebic stop`) e volta no `apply_state`,
+   então a memória sobrevive a reinícios do próprio komorebi. A anotação
+   `#[serde(default)]` mantém compatibilidade com states antigos.
+
+**Verificação empírica:** logs de traçado (`remembering geometry…` /
+`reapplied remembered geometry…`) confirmaram captura e reaplicação; o
+`state.json` passou a conter o mapa `last_window_geometry` após `komorebic
+stop`. (Observação: ao restaurar via Uncloak o komorebi às vezes re-tila a
+janela de volta para a stack de abas no monitor retrato — se comportamento
+indesejado aparecer no uso real, restringir a reaplicação para o caso em que o
+rect atual difere do salvo.)
+
+**Motivo:** janelas minimizadas “esqueciam” tamanho/posição quando o layout era
+recomputado enquanto estavam ocultas; o usuário quer que cada janela volte
+exatamente de onde saiu, nos dois monitores.
+
 ## Notas adicionais que não viraram patch
 
 - `komorebic` não foi reconstruído: o binário oficial do `komorebic.exe` é

@@ -59,6 +59,7 @@ use crate::monitor::Monitor;
 use crate::ring::Ring;
 use crate::should_act;
 use crate::should_act_individual;
+use crate::state::PersistedWindowGeometry;
 use crate::state::State;
 use crate::static_config::StaticConfig;
 use crate::transparency_manager;
@@ -92,6 +93,9 @@ pub struct WindowManager {
     pub uncloack_to_ignore: usize,
     /// Maps each known window hwnd to the (monitor, workspace) index pair managing it
     pub known_hwnds: HashMap<isize, (usize, usize)>,
+    /// custom: remembers the geometry (rect + identity) of tiled windows at the time
+    /// they were minimized, so that restoring them reapplies the same size/position
+    pub last_window_geometry: HashMap<isize, PersistedWindowGeometry>,
 }
 
 impl AsRef<Self> for WindowManager {
@@ -170,6 +174,7 @@ impl WindowManager {
             already_moved_window_handles: Arc::new(Mutex::new(HashSet::new())),
             uncloack_to_ignore: 0,
             known_hwnds: HashMap::new(),
+            last_window_geometry: HashMap::new(),
         })
     }
 
@@ -183,6 +188,11 @@ impl WindowManager {
     #[tracing::instrument(skip(self, state))]
     pub fn apply_state(&mut self, state: State) {
         let mut can_apply = true;
+
+        // custom: always restore the remembered window geometry, even if the
+        // monitor/workspace structure cannot be fully reapplied (e.g. a monitor
+        // was disconnected since the state was saved)
+        self.last_window_geometry = state.last_window_geometry;
 
         let state_monitors_len = state.monitors.elements().len();
         let current_monitors_len = self.monitors.elements().len();
@@ -1157,6 +1167,136 @@ impl WindowManager {
 
         // Make sure to give focus to the moved window again
         self.focused_window()?.focus(self.mouse_follows_focus)
+    }
+
+    /// custom: remembers the pre-minimize geometry of a tiled window so that it can
+    /// be reapplied when the window is restored. Identifies the window with the
+    /// process name and title to guard against hwnd reuse across restarts.
+    #[tracing::instrument(skip(self, window))]
+    pub fn save_window_geometry_on_cloak(&mut self, window: &Window) -> color_eyre::Result<()> {
+        let Some(&(monitor_idx, workspace_idx)) = self.known_hwnds.get(&window.hwnd) else {
+            return Ok(());
+        };
+
+        let workspace = self
+            .monitors()
+            .get(monitor_idx)
+            .ok_or_eyre("there is no monitor at this idx")?
+            .workspaces()
+            .get(workspace_idx)
+            .ok_or_eyre("there is no workspace at this idx")?;
+
+        // Only tiled windows are remembered; floating windows keep their own
+        // geometry naturally, and maximized/monocle windows have their own state
+        if workspace
+            .maximized_window
+            .as_ref()
+            .map(|max| max.hwnd == window.hwnd)
+            .unwrap_or_default()
+            || workspace
+                .monocle_container
+                .as_ref()
+                .map(|monocle| monocle.contains_window(window.hwnd))
+                .unwrap_or_default()
+            || workspace
+                .floating_windows()
+                .iter()
+                .any(|w| w.hwnd == window.hwnd)
+        {
+            return Ok(());
+        }
+
+        // The operating system has already moved the window to its minimized
+        // position at this point, so the rect has to be read from the last
+        // computed layout of the workspace instead of the current window rect
+        let container_idx = workspace
+            .container_idx_for_window(window.hwnd)
+            .ok_or_eyre("there is no container for this window")?;
+
+        let rect = *workspace
+            .latest_layout
+            .get(container_idx)
+            .ok_or_eyre("there is no layout rect for this container")?;
+
+        // Sanity check against obviously minimized/offscreen coordinates
+        if rect.top <= -28000 || rect.left <= -28000 {
+            return Ok(());
+        }
+
+        let exe = window.exe()?.to_string();
+        let title = window.title()?.to_string();
+
+        self.last_window_geometry.insert(
+            window.hwnd,
+            PersistedWindowGeometry { rect, exe, title },
+        );
+
+        tracing::info!("remembering geometry for hwnd {} rect {rect:?}", window.hwnd);
+
+        Ok(())
+    }
+
+    /// custom: reapplies the remembered geometry of a tiled window when it is
+    /// restored (uncloaked). Only fires if the window's process name still matches
+    /// what was recorded at minimize time, to avoid applying stale geometry to a
+    /// window whose handle has been reused by chance.
+    #[tracing::instrument(skip(self, hwnd))]
+    pub fn apply_saved_window_geometry(&mut self, hwnd: isize) -> color_eyre::Result<()> {
+        let Some(saved) = self.last_window_geometry.get(&hwnd).cloned() else {
+            return Ok(());
+        };
+
+        // Locate the window wherever it currently lives
+        let mut found: Option<Window> = None;
+        let mut layer = WorkspaceLayer::Tiling;
+
+        for workspace in self
+            .monitors_mut()
+            .iter_mut()
+            .flat_map(|m| m.workspaces_mut())
+        {
+            if let Some(container) = workspace.container_for_window(hwnd)
+                && let Some(found_window) = container
+                    .windows()
+                    .iter()
+                    .find(|w| w.hwnd == hwnd)
+                    .cloned()
+            {
+                found = Some(found_window);
+                layer = workspace.layer;
+            }
+        }
+
+        let Some(found_window) = found else {
+            // The window no longer exists anywhere; drop the stale entry
+            self.last_window_geometry.remove(&hwnd);
+            return Ok(());
+        };
+
+        // The title may legitimately change while the window is minimized (for
+        // example a web browser switching tabs), so only the process name is
+        // compared against what was recorded at minimize time
+        let exe_matches = found_window
+            .exe()
+            .map(|exe| exe == saved.exe)
+            .unwrap_or_default();
+
+        if !exe_matches {
+            self.last_window_geometry.remove(&hwnd);
+            return Ok(());
+        }
+
+        // Do not fight the maximize/monocle state, and floating windows manage
+        // their own geometry
+        if !matches!(layer, WorkspaceLayer::Tiling) {
+            return Ok(());
+        }
+
+        found_window.set_position(&saved.rect, false)?;
+
+        tracing::info!("reapplied remembered geometry for hwnd {} rect {:?}", hwnd, saved.rect);
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]

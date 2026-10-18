@@ -50,6 +50,17 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
+/// custom: last known geometry of a tiled window at the time it was minimized/cloaked,
+/// plus identity information used to verify that the hwnd has not been reused by
+/// another (unrelated) window, since handle values are not stable across restarts
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct PersistedWindowGeometry {
+    pub rect: Rect,
+    pub exe: String,
+    pub title: String,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -67,6 +78,8 @@ pub struct State {
     pub mouse_follows_focus: bool,
     pub has_pending_raise_op: bool,
     pub virtual_desktop_id: Option<Vec<u8>>,
+    #[serde(default)]
+    pub last_window_geometry: HashMap<isize, PersistedWindowGeometry>,
 }
 
 impl State {
@@ -306,6 +319,7 @@ impl From<&WindowManager> for State {
             has_pending_raise_op: wm.has_pending_raise_op,
             unmanaged_window_operation_behaviour: wm.unmanaged_window_operation_behaviour,
             virtual_desktop_id: wm.virtual_desktop_id.clone(),
+            last_window_geometry: wm.last_window_geometry.clone(),
         }
     }
 }
